@@ -159,7 +159,7 @@
 
                     if (useNoiseReduction && denoiseUpscaler) {
                         statusMsg.textContent = "ステップ1: ノイズ除去AIを実行中です...";
-                        const denoisedData = await denoiseUpscaler.upscale(targetImage, { patchSize: 64, padding: 2 });
+                        const denoisedData = await denoiseUpscaler.upscale(targetImage, { patchSize: 32, padding: 2 });
                         
                         const tempImg = new Image();
                         await new Promise((resolve) => {
@@ -171,7 +171,7 @@
 
                     statusMsg.textContent = "ステップ2: イラスト特化AIで拡大中です...";
                     const activeUpscaler = scale === 4 ? upscale4x : upscale2x;
-                    const upscaledData = await activeUpscaler.upscale(targetImage, { patchSize: 64, padding: 2 });
+                    const upscaledData = await activeUpscaler.upscale(targetImage, { patchSize: 32, padding: 2 });
 
                     const aiImg = new Image();
                     aiImg.onload = () => {
