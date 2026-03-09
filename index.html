@@ -11,6 +11,8 @@
         if (window.tf) {
             try {
                 tf.env().set('WEBGL_CONTEXT_ATTRIBUTES', { powerPreference: 'high-performance' });
+                tf.env().set('WEBGL_PACK', false);
+                tf.env().set('WEBGL_FORCE_F16_TEXTURES', true);
             } catch(e) {
                 console.warn("GPU setting error:", e);
             }
