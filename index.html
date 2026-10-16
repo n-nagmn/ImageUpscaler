@@ -20,9 +20,9 @@
     </script>
     
     <script src="https://cdn.jsdelivr.net/npm/upscaler@1.0.0/dist/browser/umd/upscaler.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/@upscalerjs/maxim-denoising@0.1.0/dist/umd/index.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/@upscalerjs/esrgan-thick@1.0.0/dist/umd/2x.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/@upscalerjs/esrgan-thick@1.0.0/dist/umd/4x.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@upscalerjs/maxim-denoising@0.1.0/dist/umd/models/maxim-denoising/src/umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@upscalerjs/esrgan-thick@1.0.0/dist/umd/models/esrgan-thick/src/x2/index.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@upscalerjs/esrgan-thick@1.0.0/dist/umd/models/esrgan-thick/src/x4/index.min.js"></script>
 
     <style>
         body { font-family: sans-serif; max-width: 800px; margin: 0 auto; padding: 40px 20px; line-height: 1.5; color: #333; }
@@ -37,6 +37,8 @@
         .btn:hover { background: #ddd; }
         .btn:disabled { opacity: 0.5; cursor: not-allowed; }
         #statusMessage { margin-top: 15px; font-weight: bold; color: #d35400; }
+        #statusMessage.ok { color: #2e7d32; }
+        #statusMessage.err { color: #c62828; }
         #outputContainer { margin-top: 40px; text-align: center; display: none; border-top: 2px solid #eee; padding-top: 20px; }
         #outputImage { max-width: 100%; border: 1px solid #000; margin-top: 10px; }
         #selectedFileName { margin-top: 10px; font-size: 14px; color: #0066cc; font-weight: bold; }
@@ -104,6 +106,9 @@
                         denoiseUpscaler = new window.Upscaler({ model: denoiseModel });
                     }
 
+                    if (!window.ESRGANThick2x || !window.ESRGANThick4x) {
+                        throw new Error("ESRGAN model scripts failed to load");
+                    }
                     upscale2x = new window.Upscaler({ model: window.ESRGANThick2x });
                     upscale4x = new window.Upscaler({ model: window.ESRGANThick4x });
                     
@@ -120,6 +125,7 @@
             const statusMsg = document.getElementById('statusMessage');
             
             let currentImageObj = null;
+            let busy = false;
 
             fileInput.onchange = (e) => {
                 const file = e.target.files[0];
@@ -135,21 +141,46 @@
                 reader.onload = (ev) => {
                     const img = new Image();
                     img.onload = () => {
+                        if (img.naturalWidth * img.naturalHeight > 4096000) {
+                            currentImageObj = null;
+                            fileNameDisplay.textContent = file.name;
+                            statusMsg.className = "err";
+                            statusMsg.textContent = "画像が大きすぎます（最大約2048×2048）";
+                            return;
+                        }
                         currentImageObj = img;
+                    };
+                    img.onerror = () => {
+                        currentImageObj = null;
+                        fileNameDisplay.textContent = "このファイルは読めませんでした";
+                        statusMsg.className = "err";
+                        statusMsg.textContent = "画像ファイルの読み込みに失敗しました。";
                     };
                     img.src = ev.target.result;
                 };
                 reader.readAsDataURL(file);
             };
 
+            function loadImage(src) {
+                return new Promise((resolve, reject) => {
+                    const img = new Image();
+                    img.onload = () => resolve(img);
+                    img.onerror = () => reject(new Error("Failed to load image data"));
+                    img.src = src;
+                });
+            }
+
             async function processImage(type) {
+                if (busy) return;
                 if (!currentImageObj) {
                     alert("画像を選択してください。");
                     return;
                 }
 
+                busy = true;
                 const btns = document.querySelectorAll('.btn');
                 btns.forEach(b => b.disabled = true);
+                statusMsg.className = "";
                 statusMsg.textContent = "AIが画像を処理中です。重い処理のためしばらくお待ちください...";
 
                 try {
@@ -159,53 +190,71 @@
 
                     let targetImage = currentImageObj;
 
-                    if (useNoiseReduction && denoiseUpscaler) {
-                        statusMsg.textContent = "ステップ1: ノイズ除去AIを実行中です...";
-                        const denoisedData = await denoiseUpscaler.upscale(targetImage, { patchSize: 32, padding: 2 });
-                        
-                        const tempImg = new Image();
-                        await new Promise((resolve) => {
-                            tempImg.onload = resolve;
-                            tempImg.src = denoisedData;
-                        });
-                        targetImage = tempImg;
+                    if (useNoiseReduction) {
+                        if (!denoiseUpscaler) {
+                            statusMsg.className = "err";
+                            statusMsg.textContent = "警告: ノイズ除去モデルが読み込めていないため、ノイズ除去をスキップします。";
+                        } else {
+                            statusMsg.textContent = "ステップ1: ノイズ除去AIを実行中です...";
+                            const denoisedData = await denoiseUpscaler.upscale(targetImage, { patchSize: 64, padding: 16, progress: (p) => statusMsg.textContent = "処理中: " + Math.round(p * 100) + "%" });
+
+                            const tempImg = await loadImage(denoisedData);
+                            targetImage = tempImg;
+                        }
                     }
 
                     statusMsg.textContent = "ステップ2: イラスト特化AIで拡大中です...";
                     const activeUpscaler = scale === 4 ? upscale4x : upscale2x;
-                    const upscaledData = await activeUpscaler.upscale(targetImage, { patchSize: 32, padding: 2 });
+                    const upscaledData = await activeUpscaler.upscale(targetImage, { patchSize: 64, padding: 16, progress: (p) => statusMsg.textContent = "処理中: " + Math.round(p * 100) + "%" });
 
-                    const aiImg = new Image();
-                    aiImg.onload = () => {
-                        const finalCanvas = document.createElement('canvas');
-                        finalCanvas.width = currentImageObj.width * scale;
-                        finalCanvas.height = currentImageObj.height * scale;
-                        const fCtx = finalCanvas.getContext('2d');
-                        
-                        fCtx.imageSmoothingEnabled = false;
-                        fCtx.drawImage(aiImg, 0, 0, finalCanvas.width, finalCanvas.height);
+                    const aiImg = await loadImage(upscaledData);
 
-                        const finalUrl = finalCanvas.toDataURL(format, 1.0);
+                    const finalCanvas = document.createElement('canvas');
+                    finalCanvas.width = aiImg.naturalWidth;
+                    finalCanvas.height = aiImg.naturalHeight;
+                    const fCtx = finalCanvas.getContext('2d');
 
-                        if (type === 'display') {
-                            const outImg = document.getElementById('outputImage');
-                            outImg.src = finalUrl;
-                            document.getElementById('outputContainer').style.display = 'block';
-                            statusMsg.textContent = "処理が完了しました。下に表示しています。";
-                        } else {
-                            const a = document.createElement('a');
-                            a.href = finalUrl;
-                            a.download = `waifu2x_style_${Date.now()}.${format === 'image/webp' ? 'webp' : 'png'}`;
-                            a.click();
-                            statusMsg.textContent = "保存を開始しました。";
-                        }
-                        btns.forEach(b => b.disabled = false);
-                    };
-                    aiImg.src = upscaledData;
+                    fCtx.imageSmoothingEnabled = false;
+                    fCtx.drawImage(aiImg, 0, 0, finalCanvas.width, finalCanvas.height);
 
+                    const finalUrl = finalCanvas.toDataURL(format, 1.0);
+
+                    if (type === 'display') {
+                        const outImg = document.getElementById('outputImage');
+                        outImg.src = finalUrl;
+                        document.getElementById('outputContainer').style.display = 'block';
+                        statusMsg.className = "ok";
+                        statusMsg.textContent = "処理が完了しました。下に表示しています。";
+                    } else {
+                        const base = fileInput.files[0] ? fileInput.files[0].name.replace(/\.[^.]+$/, '') : 'image';
+                        const ext = format === 'image/webp' ? 'webp' : 'png';
+
+                        const blob = await (await fetch(finalUrl)).blob();
+                        const objectUrl = URL.createObjectURL(blob);
+                        const a = document.createElement('a');
+                        a.href = objectUrl;
+                        a.download = `${base}_x${scale}.${ext}`;
+                        a.click();
+                        setTimeout(() => URL.revokeObjectURL(objectUrl), 10000);
+                        statusMsg.className = "ok";
+                        statusMsg.textContent = "保存を開始しました。";
+                    }
                 } catch (e) {
                     console.error(e);
-                    statusMsg.textContent = "エラーが発生しました: " + e.message;
+                    statusMsg.className = "err";
+                    let msg;
+                    try {
+                        if (e.message && (e.message.includes("WebGL") || e.message.includes("GPU"))) {
+                            msg = "GPU環境（WebGL）でエラーが発生しました。別のブラウザや設定をお試しください。";
+                        } else {
+                            msg = "処理に失敗しました（詳細はブラウザのコンソールを確認）";
+                        }
+                    } catch (_) {
+                        msg = "処理に失敗しました（詳細はブラウザのコンソールを確認）";
+                    }
+                    statusMsg.textContent = "エラーが発生しました: " + msg;
+                } finally {
+                    busy = false;
                     btns.forEach(b => b.disabled = false);
                 }
             }
