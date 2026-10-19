@@ -98,9 +98,14 @@
             let denoiseUpscaler = null;
             let upscale2x = null;
             let upscale4x = null;
+            let modelsReady = false;
 
-            function initModels() {
+            async function initModels() {
                 try {
+                    if (typeof window.Upscaler === "undefined" || !window.tf) {
+                        throw new Error("Upscaler/tf libraries failed to load");
+                    }
+
                     const denoiseModel = window.MaximDenoising || window.MaximDenoisingModel;
                     if (denoiseModel) {
                         denoiseUpscaler = new window.Upscaler({ model: denoiseModel });
@@ -111,14 +116,16 @@
                     }
                     upscale2x = new window.Upscaler({ model: window.ESRGANThick2x });
                     upscale4x = new window.Upscaler({ model: window.ESRGANThick4x });
-                    
+
                     console.log("Models initialized successfully.");
                 } catch (e) {
+                    document.getElementById('statusMessage').className = "err";
                     document.getElementById('statusMessage').textContent = "モデルの読み込みに失敗しました。詳細はコンソールをご確認ください。";
                     console.error(e);
+                } finally {
+                    modelsReady = true;
                 }
             }
-            initModels();
 
             const fileInput = document.getElementById('imageInput');
             const fileNameDisplay = document.getElementById('selectedFileName');
@@ -126,6 +133,16 @@
             
             let currentImageObj = null;
             let busy = false;
+
+            // Gate the process buttons until the model scripts are fully initialized
+            const btns = document.querySelectorAll('.btn');
+            btns.forEach(b => b.disabled = true);
+            statusMsg.className = "";
+            statusMsg.textContent = "モデル読み込み中...";
+            await initModels();
+            statusMsg.textContent = modelsReady ? "準備が完了しました。画像を選択してください。" : "モデルが利用できません。処理できません。";
+            statusMsg.className = modelsReady ? "" : "err";
+            btns.forEach(b => b.disabled = false);
 
             fileInput.onchange = (e) => {
                 const file = e.target.files[0];
@@ -178,8 +195,8 @@
                 }
 
                 busy = true;
-                const btns = document.querySelectorAll('.btn');
                 btns.forEach(b => b.disabled = true);
+                fileInput.disabled = true;
                 statusMsg.className = "";
                 statusMsg.textContent = "AIが画像を処理中です。重い処理のためしばらくお待ちください...";
 
@@ -195,8 +212,11 @@
                             statusMsg.className = "err";
                             statusMsg.textContent = "警告: ノイズ除去モデルが読み込めていないため、ノイズ除去をスキップします。";
                         } else {
-                            statusMsg.textContent = "ステップ1: ノイズ除去AIを実行中です...";
-                            const denoisedData = await denoiseUpscaler.upscale(targetImage, { patchSize: 64, padding: 16, progress: (p) => statusMsg.textContent = "処理中: " + Math.round(p * 100) + "%" });
+                            statusMsg.textContent = "モデルをダウンロード中... ステップ1: ノイズ除去AIを実行中です...";
+                            const denoisedData = await denoiseUpscaler.upscale(targetImage, {
+                                patchSize: 64, padding: 16,
+                                progress: (p) => statusMsg.textContent = "ノイズ除去 処理中: " + Math.round(p * 100) + "%"
+                            });
 
                             const tempImg = await loadImage(denoisedData);
                             targetImage = tempImg;
@@ -205,7 +225,13 @@
 
                     statusMsg.textContent = "ステップ2: イラスト特化AIで拡大中です...";
                     const activeUpscaler = scale === 4 ? upscale4x : upscale2x;
-                    const upscaledData = await activeUpscaler.upscale(targetImage, { patchSize: 64, padding: 16, progress: (p) => statusMsg.textContent = "処理中: " + Math.round(p * 100) + "%" });
+                    if (!activeUpscaler) {
+                        throw new Error("Upscaler model is not loaded");
+                    }
+                    const upscaledData = await activeUpscaler.upscale(targetImage, {
+                        patchSize: 64, padding: 16,
+                        progress: (p) => statusMsg.textContent = "拡大中: " + Math.round(p * 100) + "%"
+                    });
 
                     const aiImg = await loadImage(upscaledData);
 
@@ -217,10 +243,18 @@
                     fCtx.imageSmoothingEnabled = false;
                     fCtx.drawImage(aiImg, 0, 0, finalCanvas.width, finalCanvas.height);
 
+                    // Release the large data URLs held by the temporary images
+                    aiImg.src = '';
+                    if (targetImage !== currentImageObj) {
+                        targetImage.src = '';
+                    }
+
                     const finalUrl = finalCanvas.toDataURL(format, 1.0);
 
                     if (type === 'display') {
                         const outImg = document.getElementById('outputImage');
+                        // Clear the previous output before showing the new one
+                        outImg.removeAttribute('src');
                         outImg.src = finalUrl;
                         document.getElementById('outputContainer').style.display = 'block';
                         statusMsg.className = "ok";
@@ -256,6 +290,7 @@
                 } finally {
                     busy = false;
                     btns.forEach(b => b.disabled = false);
+                    fileInput.disabled = false;
                 }
             }
 
