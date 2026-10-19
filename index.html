@@ -122,9 +122,8 @@
                     document.getElementById('statusMessage').className = "err";
                     document.getElementById('statusMessage').textContent = "モデルの読み込みに失敗しました。詳細はコンソールをご確認ください。";
                     console.error(e);
-                } finally {
-                    modelsReady = true;
                 }
+                modelsReady = !!(upscale2x && upscale4x);
             }
 
             const fileInput = document.getElementById('imageInput');
@@ -154,28 +153,59 @@
 
                 fileNameDisplay.textContent = "選択中: " + file.name;
 
-                const reader = new FileReader();
-                reader.onload = (ev) => {
-                    const img = new Image();
-                    img.onload = () => {
-                        if (img.naturalWidth * img.naturalHeight > 4096000) {
+                const rejectTooLarge = () => {
+                    currentImageObj = null;
+                    fileNameDisplay.textContent = file.name;
+                    statusMsg.className = "err";
+                    statusMsg.textContent = "画像が大きすぎます（最大約2048×2048）";
+                };
+
+                const loadViaFileReader = () => {
+                    const reader = new FileReader();
+                    reader.onload = (ev) => {
+                        const img = new Image();
+                        img.onload = () => currentImageObj = img;
+                        img.onerror = () => {
                             currentImageObj = null;
-                            fileNameDisplay.textContent = file.name;
+                            fileNameDisplay.textContent = "このファイルは読めませんでした";
                             statusMsg.className = "err";
-                            statusMsg.textContent = "画像が大きすぎます（最大約2048×2048）";
+                            statusMsg.textContent = "画像ファイルの読み込みに失敗しました。";
+                        };
+                        img.src = ev.target.result;
+                    };
+                    reader.readAsDataURL(file);
+                };
+
+                // Check dimensions before a full decode to avoid decoding huge images
+                if (typeof createImageBitmap === "function") {
+                    createImageBitmap(file).then((bitmap) => {
+                        if (bitmap.width * bitmap.height > 4096000) {
+                            bitmap.close();
+                            rejectTooLarge();
                             return;
                         }
-                        currentImageObj = img;
-                    };
-                    img.onerror = () => {
-                        currentImageObj = null;
-                        fileNameDisplay.textContent = "このファイルは読めませんでした";
-                        statusMsg.className = "err";
-                        statusMsg.textContent = "画像ファイルの読み込みに失敗しました。";
-                    };
-                    img.src = ev.target.result;
-                };
-                reader.readAsDataURL(file);
+                        const img = new Image();
+                        img.onload = () => currentImageObj = img;
+                        img.onerror = () => {
+                            currentImageObj = null;
+                            fileNameDisplay.textContent = "このファイルは読めませんでした";
+                            statusMsg.className = "err";
+                            statusMsg.textContent = "画像ファイルの読み込みに失敗しました。";
+                        };
+                        img.src = URL.createObjectURL(file);
+                    }).catch(() => {
+                        // createImageBitmap failed; fall back to the FileReader path
+                        loadViaFileReader();
+                    });
+                    return;
+                }
+
+                // Fallback heuristic: assume >=1 byte/px; 4MB covers 4096000px
+                if (file.size > 4194304) {
+                    rejectTooLarge();
+                    return;
+                }
+                loadViaFileReader();
             };
 
             function loadImage(src) {
@@ -244,12 +274,16 @@
                     fCtx.drawImage(aiImg, 0, 0, finalCanvas.width, finalCanvas.height);
 
                     // Release the large data URLs held by the temporary images
-                    aiImg.src = '';
+                    aiImg.src = 'data:,';
                     if (targetImage !== currentImageObj) {
-                        targetImage.src = '';
+                        targetImage.src = 'data:,';
                     }
 
                     const finalUrl = finalCanvas.toDataURL(format, 1.0);
+
+                    // Release the large canvas backing store now that the data URL is extracted
+                    finalCanvas.width = 0;
+                    finalCanvas.height = 0;
 
                     if (type === 'display') {
                         const outImg = document.getElementById('outputImage');
@@ -263,13 +297,10 @@
                         const base = fileInput.files[0] ? fileInput.files[0].name.replace(/\.[^.]+$/, '') : 'image';
                         const ext = format === 'image/webp' ? 'webp' : 'png';
 
-                        const blob = await (await fetch(finalUrl)).blob();
-                        const objectUrl = URL.createObjectURL(blob);
                         const a = document.createElement('a');
-                        a.href = objectUrl;
+                        a.href = finalUrl;
                         a.download = `${base}_x${scale}.${ext}`;
                         a.click();
-                        setTimeout(() => URL.revokeObjectURL(objectUrl), 10000);
                         statusMsg.className = "ok";
                         statusMsg.textContent = "保存を開始しました。";
                     }
