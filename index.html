@@ -85,6 +85,7 @@
     <div class="actions">
         <button type="button" id="displayBtn" class="btn">ページに表示</button>
         <button type="button" id="downloadBtn" class="btn">保存</button>
+        <button type="button" id="cancelBtn" class="btn" style="display: none;">中止</button>
     </div>
     
     <div id="statusMessage"></div>
@@ -99,59 +100,207 @@
             let upscale2x = null;
             let upscale4x = null;
             let modelsReady = false;
+            let activeUpscaler = null;
+            let loadSeq = 0;
+            let cachedFileName = null;
+
+            // statusMsg / btns are assigned later in the onload body, but
+            // the WebGL context listeners below only ever fire after boot
+            // has finished, so the guard on each access is enough.
+            let statusMsg = null;
+            let btns = null;
+
+            function handleContextLost(e) {
+                if (e && e.preventDefault) e.preventDefault();
+                if (statusMsg) {
+                    statusMsg.className = "err";
+                    statusMsg.textContent = "GPUコンテキストを失いました。復元を待っています...";
+                }
+            }
+            function handleContextRestored() {
+                (async () => {
+                    try { await tf.disposeVariables(); } catch (_) {}
+                    denoiseUpscaler = null;
+                    upscale2x = null;
+                    upscale4x = null;
+                    modelsReady = false;
+                    if (statusMsg) {
+                        statusMsg.className = "err";
+                        statusMsg.textContent = "GPUコンテキストを復元しました。モデルを再読み込みしています...";
+                    }
+                    try {
+                        await initModels();
+                    } catch (_) { /* error already logged inside initModels */ }
+                    if (statusMsg) {
+                        statusMsg.textContent = modelsReady
+                            ? "モデルが復元されました。処理を続行してください。"
+                            : "モデルの復元失敗しました。ページを再読み込みしてください。";
+                        statusMsg.className = modelsReady ? "" : "err";
+                    }
+                    if (btns) btns.forEach(b => b.disabled = !modelsReady);
+                })();
+            }
+
+            function initContextListeners() {
+                // H1: attach webglcontextlost/restored to the WebGL context
+                // the TF.js WebGL backend actually uses. We find that canvas
+                // by scanning document canvases for the 1x1 probe canvas
+                // TF.js creates, and attach listeners to the *canvas element*
+                // (canvas-context events fire on the canvas, not on the
+                // GL context object).
+                try {
+                    tf.ready().then(() => {
+                        let canvas = null;
+                        for (const c of document.querySelectorAll('canvas')) {
+                            if (c.width === 1 && c.height === 1) { canvas = c; break; }
+                        }
+                        if (!canvas) {
+                            // TF.js hasn't created its canvas yet (no
+                            // warmup ran). Create a probe canvas; we won't
+                            // see the real backend's loss, but the backend
+                            // probe in processImage will catch it at run time.
+                            canvas = document.createElement('canvas');
+                            canvas.width = 1;
+                            canvas.height = 1;
+                            document.body.appendChild(canvas);
+                        }
+                        if (!canvas._listenersAdded) {
+                            canvas.addEventListener('webglcontextlost', handleContextLost);
+                            canvas.addEventListener('webglcontextrestored', handleContextRestored);
+                            canvas._listenersAdded = true;
+                        }
+                    }).catch((e) => {
+                        console.warn("Failed to attach WebGL context listeners:", e);
+                    });
+                } catch (e) {
+                    console.warn("Failed to attach WebGL context listeners:", e);
+                }
+            }
+
+            function probeBackend() {
+                // H1: verify the WebGL backend is still alive before each run.
+                // A trivial tensor op on the GPU surface throws if the
+                // underlying WebGL context has been lost.
+                try {
+                    if (typeof tf === 'undefined' || typeof tf.ready !== 'function') return;
+                    tf.ready().then(() => {
+                        const x = tf.scalar(1);
+                        return x.square().data().then((d) => {
+                            x.dispose();
+                        });
+                    }).catch((e) => {
+                        console.error("Backend probe failed:", e);
+                        if (statusMsg) {
+                            statusMsg.className = "err";
+                            statusMsg.textContent = "GPUバックエンドが利用できません。WebGLコンテキストが失われた可能性があります。";
+                        }
+                    });
+                } catch (e) {
+                    console.warn("Backend probe error:", e);
+                }
+            }
 
             async function initModels() {
-                try {
-                    if (typeof window.Upscaler === "undefined" || !window.tf) {
-                        throw new Error("Upscaler/tf libraries failed to load");
-                    }
-
-                    const denoiseModel = window.MaximDenoising || window.MaximDenoisingModel;
-                    if (denoiseModel) {
-                        denoiseUpscaler = new window.Upscaler({ model: denoiseModel });
-                    }
-
-                    if (!window.ESRGANThick2x || !window.ESRGANThick4x) {
-                        throw new Error("ESRGAN model scripts failed to load");
-                    }
-                    upscale2x = new window.Upscaler({ model: window.ESRGANThick2x });
-                    upscale4x = new window.Upscaler({ model: window.ESRGANThick4x });
-
-                    console.log("Models initialized successfully.");
-                } catch (e) {
-                    document.getElementById('statusMessage').className = "err";
-                    document.getElementById('statusMessage').textContent = "モデルの読み込みに失敗しました。詳細はコンソールをご確認ください。";
-                    console.error(e);
+                if (typeof window.Upscaler === "undefined" || !window.tf) {
+                    throw new Error("Upscaler/tf libraries failed to load");
                 }
+
+                const denoiseModel = window.MaximDenoising || window.MaximDenoisingModel;
+                if (denoiseModel) {
+                    denoiseUpscaler = new window.Upscaler({ model: denoiseModel });
+                }
+
+                if (!window.ESRGANThick2x || !window.ESRGANThick4x) {
+                    throw new Error("ESRGAN model scripts failed to load");
+                }
+                upscale2x = new window.Upscaler({ model: window.ESRGANThick2x });
+                upscale4x = new window.Upscaler({ model: window.ESRGANThick4x });
+
+                // H2: await each upscaler's .ready so we only report success
+                // when every model is actually loaded and warmed up. If any
+                // of them rejects, Promise.all rejects and initModels
+                // propagates the failure, keeping modelsReady = false and
+                // leaving the process buttons disabled.
+                console.log("Models constructed. Waiting for ready...");
+                const readyPromises = [];
+                if (denoiseUpscaler) readyPromises.push(denoiseUpscaler.ready);
+                readyPromises.push(upscale2x.ready);
+                readyPromises.push(upscale4x.ready);
+
+                await Promise.all(readyPromises);
+
                 modelsReady = !!(upscale2x && upscale4x);
+                console.log("Models initialized successfully.");
             }
 
             const fileInput = document.getElementById('imageInput');
             const fileNameDisplay = document.getElementById('selectedFileName');
-            const statusMsg = document.getElementById('statusMessage');
-            
+            statusMsg = document.getElementById('statusMessage');
+            const cancelBtn = document.getElementById('cancelBtn');
+            const outputContainer = document.getElementById('outputContainer');
+            const outputImage = document.getElementById('outputImage');
+
             let currentImageObj = null;
             let busy = false;
 
-            // Gate the process buttons until the model scripts are fully initialized
-            const btns = document.querySelectorAll('.btn');
+            // H2: gate the process buttons until the models are fully ready.
+            btns = document.querySelectorAll('.btn');
             btns.forEach(b => b.disabled = true);
             statusMsg.className = "";
             statusMsg.textContent = "モデル読み込み中...";
-            await initModels();
-            statusMsg.textContent = modelsReady ? "準備が完了しました。画像を選択してください。" : "モデルが利用できません。処理できません。";
-            statusMsg.className = modelsReady ? "" : "err";
-            btns.forEach(b => b.disabled = false);
+
+            // H5: wrap the entire onload body in try/catch so we always end
+            // with a known-good UI state.
+            let bootError = null;
+            try {
+                await initModels();
+                initContextListeners();
+            } catch (e) {
+                bootError = e;
+                console.error("Model init failed:", e);
+            } finally {
+                statusMsg.textContent = modelsReady
+                    ? "準備が完了しました。画像を選択してください。"
+                    : (bootError
+                        ? "モデルの読み込みに失敗しました。詳細はコンソールをご確認ください。"
+                        : "モデルが利用できません。処理できません。");
+                statusMsg.className = modelsReady ? "" : "err";
+                btns.forEach(b => b.disabled = !modelsReady);
+            }
 
             fileInput.onchange = (e) => {
                 const file = e.target.files[0];
                 if (!file) {
                     currentImageObj = null;
+                    cachedFileName = null;
                     fileNameDisplay.textContent = "";
                     return;
                 }
 
+                // M8: validate the file type against the accepted whitelist
+                // before doing any processing.
+                const allowedTypes = ["image/png", "image/jpeg", "image/webp"];
+                if (!allowedTypes.includes(file.type)) {
+                    currentImageObj = null;
+                    fileNameDisplay.textContent = file.name;
+                    statusMsg.className = "err";
+                    statusMsg.textContent = "対応していないファイル形式です（PNG / JPEG / WebP に対応しています）。";
+                    return;
+                }
+
+                // M9: cache file.name at selection time so we don't have to
+                // re-read from the input later (and can use it for the
+                // download name even if the input is cleared).
+                cachedFileName = file.name;
                 fileNameDisplay.textContent = "選択中: " + file.name;
+
+                // L7: hide any previous output so a new selection doesn't
+                // leave stale results on screen.
+                outputContainer.style.display = 'none';
+
+                // H6: every selection invalidates any in-flight bitmap load.
+                loadSeq += 1;
+                const seq = loadSeq;
 
                 const rejectTooLarge = () => {
                     currentImageObj = null;
@@ -160,18 +309,34 @@
                     statusMsg.textContent = "画像が大きすぎます（最大約2048×2048）";
                 };
 
+                const showLoadError = () => {
+                    currentImageObj = null;
+                    fileNameDisplay.textContent = "このファイルは読めませんでした";
+                    statusMsg.className = "err";
+                    statusMsg.textContent = "画像ファイルの読み込みに失敗しました。";
+                };
+
                 const loadViaFileReader = () => {
                     const reader = new FileReader();
                     reader.onload = (ev) => {
+                        const dataUrl = ev.target.result;
                         const img = new Image();
-                        img.onload = () => currentImageObj = img;
-                        img.onerror = () => {
-                            currentImageObj = null;
-                            fileNameDisplay.textContent = "このファイルは読めませんでした";
-                            statusMsg.className = "err";
-                            statusMsg.textContent = "画像ファイルの読み込みに失敗しました。";
+                        img.onload = () => {
+                            // M1: release the data URL once decoded.
+                            URL.revokeObjectURL(dataUrl);
+                            if (seq !== loadSeq) return; // stale
+                            currentImageObj = img;
                         };
-                        img.src = ev.target.result;
+                        img.onerror = () => {
+                            URL.revokeObjectURL(dataUrl);
+                            if (seq !== loadSeq) return; // stale
+                            showLoadError();
+                        };
+                        img.src = dataUrl;
+                    };
+                    reader.onerror = () => {
+                        if (seq !== loadSeq) return; // stale
+                        showLoadError();
                     };
                     reader.readAsDataURL(file);
                 };
@@ -179,22 +344,43 @@
                 // Check dimensions before a full decode to avoid decoding huge images
                 if (typeof createImageBitmap === "function") {
                     createImageBitmap(file).then((bitmap) => {
-                        if (bitmap.width * bitmap.height > 4096000) {
+                        // H6: only trust this bitmap if no newer selection
+                        // has invalidated it.
+                        if (seq !== loadSeq) {
                             bitmap.close();
+                            return;
+                        }
+                        let tooLarge = false;
+                        try {
+                            tooLarge = bitmap.width * bitmap.height > 4096000;
+                        } finally {
+                            // H6: always close the bitmap after reading
+                            // dimensions, even on the success path.
+                            bitmap.close();
+                        }
+                        if (tooLarge) {
                             rejectTooLarge();
                             return;
                         }
+                        const blobUrl = URL.createObjectURL(file);
                         const img = new Image();
-                        img.onload = () => currentImageObj = img;
-                        img.onerror = () => {
-                            currentImageObj = null;
-                            fileNameDisplay.textContent = "このファイルは読めませんでした";
-                            statusMsg.className = "err";
-                            statusMsg.textContent = "画像ファイルの読み込みに失敗しました。";
+                        img.onload = () => {
+                            // M1: the blob URL is now decoded into the img;
+                            // release it so it doesn't leak in memory.
+                            URL.revokeObjectURL(blobUrl);
+                            if (seq !== loadSeq) return; // stale
+                            currentImageObj = img;
                         };
-                        img.src = URL.createObjectURL(file);
+                        img.onerror = () => {
+                            URL.revokeObjectURL(blobUrl);
+                            if (seq !== loadSeq) return; // stale
+                            showLoadError();
+                        };
+                        img.src = blobUrl;
                     }).catch(() => {
-                        // createImageBitmap failed; fall back to the FileReader path
+                        // createImageBitmap failed; fall back to the FileReader
+                        // path (only if this selection is still the latest).
+                        if (seq !== loadSeq) return;
                         loadViaFileReader();
                     });
                     return;
@@ -211,8 +397,22 @@
             function loadImage(src) {
                 return new Promise((resolve, reject) => {
                     const img = new Image();
-                    img.onload = () => resolve(img);
-                    img.onerror = () => reject(new Error("Failed to load image data"));
+                    img.onload = () => {
+                        // M1: the src here is either a blob: URL (created for
+                        // the initial bitmap path) or a data: URL. Revoke the
+                        // blob URL now that decode is done; revoking a data:
+                        // URL is a harmless no-op.
+                        if (src && src.startsWith('blob:')) {
+                            URL.revokeObjectURL(src);
+                        }
+                        resolve(img);
+                    };
+                    img.onerror = () => {
+                        if (src && src.startsWith('blob:')) {
+                            URL.revokeObjectURL(src);
+                        }
+                        reject(new Error("Failed to load image data"));
+                    };
                     img.src = src;
                 });
             }
@@ -224,16 +424,47 @@
                     return;
                 }
 
+                // H1: probe the backend before kicking off the heavy work so
+                // a lost WebGL context surfaces early.
+                probeBackend();
+
                 busy = true;
                 btns.forEach(b => b.disabled = true);
                 fileInput.disabled = true;
+                cancelBtn.style.display = ''; // M5: show the cancel button
                 statusMsg.className = "";
                 statusMsg.textContent = "AIが画像を処理中です。重い処理のためしばらくお待ちください...";
+
+                // H4: resource cleanup. These hold references to large
+                // intermediate data and blob URLs and must be released on
+                // every exit path (success, error, abort).
+                let tempImgBlobUrl = null;
+                let aiImgSrc = null;
+                let targetSrc = null;
+                let finalCanvas = null;
 
                 try {
                     const useNoiseReduction = document.querySelector('input[name="noise"]:checked').value === "1";
                     const scale = parseInt(document.querySelector('input[name="scale"]:checked').value);
                     const format = document.querySelector('input[name="format"]:checked').value;
+
+                    // L5: only 2x and 4x are supported by the ESRGAN models.
+                    if (scale !== 2 && scale !== 4) {
+                        throw new Error("無効なアップスケール倍率です（2または4を指定してください）");
+                    }
+
+                    // H3: WebGL texture limits. Reject early with a clear
+                    // message instead of letting the model blow up mid-run.
+                    const inputW = currentImageObj.naturalWidth || currentImageObj.width;
+                    const inputH = currentImageObj.naturalHeight || currentImageObj.height;
+                    const outW = inputW * scale;
+                    const outH = inputH * scale;
+                    if (outW > 16384 || outH > 16384) {
+                        throw new Error(
+                            "出力サイズがWebGLの最大テクスチャサイズ（16384px）を超過します: "
+                            + outW + "x" + outH
+                        );
+                    }
 
                     let targetImage = currentImageObj;
 
@@ -242,59 +473,69 @@
                             statusMsg.className = "err";
                             statusMsg.textContent = "警告: ノイズ除去モデルが読み込めていないため、ノイズ除去をスキップします。";
                         } else {
-                            statusMsg.textContent = "モデルをダウンロード中... ステップ1: ノイズ除去AIを実行中です...";
+                            statusMsg.textContent = "ステップ1: ノイズ除去AIを実行中です...";
                             const denoisedData = await denoiseUpscaler.upscale(targetImage, {
                                 patchSize: 64, padding: 16,
                                 progress: (p) => statusMsg.textContent = "ノイズ除去 処理中: " + Math.round(p * 100) + "%"
                             });
 
-                            const tempImg = await loadImage(denoisedData);
-                            targetImage = tempImg;
+                            tempImgBlobUrl = denoisedData;
+                            targetImage = await loadImage(denoisedData);
                         }
                     }
 
                     statusMsg.textContent = "ステップ2: イラスト特化AIで拡大中です...";
-                    const activeUpscaler = scale === 4 ? upscale4x : upscale2x;
-                    if (!activeUpscaler) {
+                    // M5: track the active upscaler so the cancel button can
+                    // call abort() on the one that is actually running.
+                    const upscaler = scale === 4 ? upscale4x : upscale2x;
+                    if (!upscaler) {
                         throw new Error("Upscaler model is not loaded");
                     }
+                    activeUpscaler = upscaler;
                     const upscaledData = await activeUpscaler.upscale(targetImage, {
                         patchSize: 64, padding: 16,
                         progress: (p) => statusMsg.textContent = "拡大中: " + Math.round(p * 100) + "%"
                     });
 
+                    aiImgSrc = upscaledData;
                     const aiImg = await loadImage(upscaledData);
 
-                    const finalCanvas = document.createElement('canvas');
-                    finalCanvas.width = aiImg.naturalWidth;
-                    finalCanvas.height = aiImg.naturalHeight;
-                    const fCtx = finalCanvas.getContext('2d');
-
-                    fCtx.imageSmoothingEnabled = false;
-                    fCtx.drawImage(aiImg, 0, 0, finalCanvas.width, finalCanvas.height);
-
-                    // Release the large data URLs held by the temporary images
-                    aiImg.src = 'data:,';
-                    if (targetImage !== currentImageObj) {
-                        targetImage.src = 'data:,';
+                    // M3: wrap the canvas section in try/finally so that if
+                    // anything here throws, the canvas dimensions are reset
+                    // and we don't leave a half-sized canvas around.
+                    finalCanvas = document.createElement('canvas');
+                    let finalUrl = null;
+                    try {
+                        finalCanvas.width = aiImg.naturalWidth;
+                        finalCanvas.height = aiImg.naturalHeight;
+                        const fCtx = finalCanvas.getContext('2d');
+                        // M7: draw 1:1 (source size matches destination);
+                        // smoothing is irrelevant for an identity copy.
+                        fCtx.drawImage(aiImg, 0, 0);
+                        finalUrl = finalCanvas.toDataURL(format, 1.0);
+                    } finally {
+                        // Reset dimensions whether or not the copy succeeded
+                        // so the canvas never holds a stale backing store.
+                        if (finalCanvas) {
+                            finalCanvas.width = 0;
+                            finalCanvas.height = 0;
+                        }
+                    }
+                    if (!finalUrl) {
+                        throw new Error("Could not extract final image data");
                     }
 
-                    const finalUrl = finalCanvas.toDataURL(format, 1.0);
-
-                    // Release the large canvas backing store now that the data URL is extracted
-                    finalCanvas.width = 0;
-                    finalCanvas.height = 0;
-
                     if (type === 'display') {
-                        const outImg = document.getElementById('outputImage');
                         // Clear the previous output before showing the new one
-                        outImg.removeAttribute('src');
-                        outImg.src = finalUrl;
-                        document.getElementById('outputContainer').style.display = 'block';
+                        outputImage.removeAttribute('src');
+                        outputImage.src = finalUrl;
+                        outputContainer.style.display = 'block';
                         statusMsg.className = "ok";
                         statusMsg.textContent = "処理が完了しました。下に表示しています。";
                     } else {
-                        const base = fileInput.files[0] ? fileInput.files[0].name.replace(/\.[^.]+$/, '') : 'image';
+                        // M9: use the cached file name captured at selection
+                        // time so the download name is stable.
+                        const base = cachedFileName ? cachedFileName.replace(/\.[^.]+$/, '') : 'image';
                         const ext = format === 'image/webp' ? 'webp' : 'png';
 
                         const a = document.createElement('a');
@@ -308,25 +549,65 @@
                     console.error(e);
                     statusMsg.className = "err";
                     let msg;
+                    // M5: detect a user-initiated abort (the library throws
+                    // an Error whose message mentions the abort signal).
+                    const aborted = (e && (e.name === 'AbortError'
+                        || (e.message && (
+                            e.message.includes("abort signal")
+                            || e.message.includes("abort")
+                            || e.message.includes("Abort")))));
                     try {
-                        if (e.message && (e.message.includes("WebGL") || e.message.includes("GPU"))) {
+                        if (aborted) {
+                            msg = "処理が中止されました。";
+                        } else if (e.message && (e.message.includes("WebGL") || e.message.includes("GPU"))) {
                             msg = "GPU環境（WebGL）でエラーが発生しました。別のブラウザや設定をお試しください。";
+                        } else if (e.message && e.message.includes("16384")) {
+                            msg = e.message;
+                        } else if (e.message && e.message.includes("無効なアップスケール倍率")) {
+                            msg = e.message;
                         } else {
                             msg = "処理に失敗しました（詳細はブラウザのコンソールを確認）";
                         }
                     } catch (_) {
                         msg = "処理に失敗しました（詳細はブラウザのコンソールを確認）";
                     }
-                    statusMsg.textContent = "エラーが発生しました: " + msg;
+                    statusMsg.textContent = (aborted ? "中止しました: " : "エラーが発生しました: ") + msg;
                 } finally {
+                    // H4: always release the intermediate resources, on every
+                    // exit path (success, error, abort). Nulling the local
+                    // refs lets GC reclaim the large data-URL strings held
+                    // by the temporary <img> elements.
+                    aiImgSrc = null;
+                    targetSrc = null;
+                    tempImgBlobUrl = null;
+                    // Reset the canvas backing store if we created one
+                    if (finalCanvas) {
+                        finalCanvas.width = 0;
+                        finalCanvas.height = 0;
+                        finalCanvas = null;
+                    }
+                    // M5: clear the active upscaler handle so a stale cancel
+                    // can't hit a dead upscaler. (The library's internal
+                    // AbortController is already reset by abort().)
+                    activeUpscaler = null;
+                    // L4: reset the status message class so the next run
+                    // doesn't inherit an err/ok color.
+                    statusMsg.className = "";
                     busy = false;
                     btns.forEach(b => b.disabled = false);
                     fileInput.disabled = false;
+                    cancelBtn.style.display = 'none';
                 }
             }
 
             document.getElementById('displayBtn').onclick = () => processImage('display');
             document.getElementById('downloadBtn').onclick = () => processImage('download');
+            // M5: cancel the in-flight upscaler run, if any.
+            cancelBtn.onclick = () => {
+                if (activeUpscaler && typeof activeUpscaler.abort === 'function') {
+                    activeUpscaler.abort();
+                }
+            };
         };
     </script>
 </body>
